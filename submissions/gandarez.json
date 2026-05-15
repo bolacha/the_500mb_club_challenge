@@ -1,0 +1,32 @@
+{
+    "submissions": [
+        {
+            "id": "go",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_go"
+        }, {
+            "id": "python",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_python"
+        }, {
+            "id": "rust",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_rust"
+        }, {
+            "id": "java",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_java"
+        }, {
+            "id": "csharp",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_csharp"
+        }, {
+            "id": "cpp",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_cpp"
+        }, {
+            "id": "nodejs",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_nodejs"
+        }, {
+            "id": "elixir",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_elixir"
+        }, {
+            "id": "zig",
+            "repo_url": "https://github.com/gandarez/the_500mb_club_source_code_zig"
+        }
+    ]
+}

@@ -1,0 +1,327 @@
+name: PR Security Gate
+
+# ---------------------------------------------------------------------------
+# NOVO FLUXO (o PR nao traz mais o compose):
+#
+#   1. O PR adiciona exatamente um arquivo `submissions/<username>.json`.
+#      O JSON contem `submissions[]`, um array (1 ou mais) de
+#      `{id, repo_url}`. O participante pode submeter mais de uma
+#      implementacao no mesmo arquivo (linguagens/variantes diferentes).
+#   2. resolve_submission.py valida (1) arquivo único e (2) cada
+#      `{id, repo_url}`: id unico no arquivo + repo pertence ao
+#      `<username>`. Tambem barra repo_url fora de github.com
+#      (anti-SSRF) ANTES de qualquer clone. Emite `submissions.json`
+#      com a lista canonicalizada - mas APENAS com as submissoes novas
+#      ou alteradas em relacao ao base ref (diff incremental). As
+#      inalteradas ja foram validadas no PR que as introduziu; pula-las
+#      evita re-clonar/re-auditar tudo e poluir o comentario.
+#   3. Para CADA submissao (nova/alterada), o workflow faz `git ls-remote` (branch
+#      `implementation`), clona, valida `me.json`, expande compose,
+#      injeta hardening, valida e auditoria de imagem.
+#   4. Tudo vira um comentario unico com checklist no PR (via workflow_run),
+#      com uma secao por submissao.
+#
+# MODELO DE SEGURANCA (ler antes de editar):
+#   * Trigger `pull_request`: token read-only, SEM segredos.
+#   * As regras (scripts/*) sao checkout do BASE ref, nao do PR - o PR nao
+#     consegue reescrever o proprio validador.
+#   * NENHUM codigo do PR nem dos repos clonados são executados. Só parsing
+#     de YAML/JSON, git ls-remote/clone, docker pull/inspect/history. Nenhum
+#     `docker compose up`, nenhum script da submissão, nenhum hook git.
+#   * repo_url é validado por regex estrita (só github.com) antes do clone.
+#   * Comentário no PR: workflow separado via workflow_run (contexto base).
+# ---------------------------------------------------------------------------
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "submissions/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-security-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Resolve + validate submission
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GIT_TERMINAL_PROMPT: "0"          # git nunca trava pedindo credencial
+    steps:
+      # 1. Regras a partir do BASE ref (PR nao altera o proprio validador).
+      - name: Checkout base (rules)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      # 2. Conteudo do PR. Apenas LIDO (para achar o submissions/*.json).
+      - name: Checkout PR (read-only)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 0          # precisamos do base para o diff
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      # 3. Lista de arquivos alterados no PR (git puro, sem action de terceiro).
+      - name: PR diff
+        working-directory: pr
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          git diff --name-only --diff-filter=ACMRD "$base...$head" \
+            > /tmp/changed.txt || true
+          echo "Arquivos alterados:"; cat /tmp/changed.txt
+
+      - name: Prepare report
+        run: |
+          {
+            echo "## The 500MB Club — PR Security Gate"
+            echo
+          } > /tmp/report.md
+
+      # 4. Validações 1 e 2 (resolve_submission.py). Sem rede.
+      - name: Resolve submission (validations 1 and 2)
+        id: resolve
+        run: |
+          set -uo pipefail
+          if python3 base/scripts/resolve_submission.py \
+               --changed-files /tmp/changed.txt \
+               --pr-dir pr \
+               --base-dir base \
+               --md /tmp/frag-resolve.md \
+               --meta-out /tmp/meta.env \
+               --submissions-out /tmp/submissions.json; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+          cat /tmp/frag-resolve.md >> /tmp/report.md
+          echo >> /tmp/report.md
+          # exporta meta como saídas do step
+          while IFS='=' read -r k v; do
+            echo "${k,,}=${v}" >> "$GITHUB_OUTPUT"
+          done < /tmp/meta.env
+
+      # 5. Loop por submissao: branch -> clone -> me.json -> compose ->
+      #    auditoria de imagem. Por design, falha em uma submissao NAO
+      #    interrompe as demais (PR mostra todos os erros de uma vez).
+      - name: Validate submissions
+        id: subs
+        if: steps.resolve.outputs.ok == '1'
+        env:
+          API_IMAGE: "placeholder/for-config-expand:latest"
+        run: |
+          set -uo pipefail
+          overall=1
+          count=$(jq 'length' /tmp/submissions.json)
+
+          # Bloco que separa seções no relatório com UMA linha em branco
+          # antes de cada cabeçalho. Cada `cat fragmento` cuida da própria
+          # lista contígua; aqui só garantimos o respiro entre seções.
+          section() {  # section <arquivo-fragmento>
+            printf '\n' >> /tmp/report.md
+            cat "$1" >> /tmp/report.md
+          }
+
+          for i in $(seq 0 $((count - 1))); do
+            id=$(jq -r ".[$i].id" /tmp/submissions.json)
+            url=$(jq -r ".[$i].repo_url" /tmp/submissions.json)
+            sub_ok=1
+            clone_dir="/tmp/impl-$id"
+            # Buffers por seção, montados no fim em ordem e bem espaçados.
+            repo_md="/tmp/repo-$id.md"; : > "$repo_md"
+            me_md="/tmp/me-$id.md"; : > "$me_md"
+            compose_md="/tmp/compose-$id.md"; : > "$compose_md"
+            img_md="/tmp/img-$id.md"; : > "$img_md"
+
+            echo "::group::submission '$id' ($url)"
+
+            # 5a. Repositório: branch implementation existe? (ls-remote)
+            #     Os checks de repositório vão todos para $repo_md, formando
+            #     uma única lista contígua sob "### Repositório".
+            if timeout 30 git ls-remote --heads "$url" implementation \
+                 | grep -q 'refs/heads/implementation'; then
+              echo "- [x] Branch \`implementation\` exists in \`$url\`" >> "$repo_md"
+            else
+              echo "- [ ] Branch \`implementation\` exists in \`$url\` — ❌" >> "$repo_md"
+              echo "  - ❌ branch missing or repository inaccessible" >> "$repo_md"
+              sub_ok=0
+            fi
+
+            # 5b. clone raso
+            if [ "$sub_ok" = "1" ]; then
+              rm -rf "$clone_dir"
+              if timeout 120 git -c protocol.file.allow=never \
+                   clone --depth 1 --single-branch --branch implementation \
+                   --no-tags "$url" "$clone_dir"; then
+                rm -rf "$clone_dir/.git"
+              else
+                echo "- [ ] Clone of branch implementation — ❌" >> "$repo_md"
+                echo "  - ❌ git clone failed" >> "$repo_md"
+                sub_ok=0
+              fi
+            fi
+
+            # 5c. me.json (seção própria; o fragmento já traz seu cabeçalho).
+            if [ "$sub_ok" = "1" ]; then
+              if python3 "$GITHUB_WORKSPACE/base/scripts/validate_me_json.py" \
+                   --me-json "$clone_dir/me.json" --md "$me_md"; then :
+              else sub_ok=0; fi
+            fi
+
+            # 5d. discovery do compose (check de repositório -> $repo_md).
+            files=""
+            if [ "$sub_ok" = "1" ]; then
+              files=$(cd "$clone_dir" && ls docker-compose*.yml docker-compose*.yaml 2>/dev/null || true)
+              if [ -z "$files" ]; then
+                echo "- [ ] Repository contains docker-compose — ❌" >> "$repo_md"
+                echo "  - ❌ no docker-compose*.yml on the implementation branch" >> "$repo_md"
+                sub_ok=0
+              else
+                echo "- [x] Repository contains docker-compose" >> "$repo_md"
+              fi
+            fi
+
+            # 5e. compose: resolve -> harden -> validate. Falha aqui marca
+            #     a submissao mas processa o resto para feedback completo.
+            if [ "$sub_ok" = "1" ]; then
+              for f in $files; do
+                echo "::group::compose $id $f"
+                resolved="/tmp/resolved-$id-$(basename "$f").yml"
+                hardened="/tmp/hardened-$id-$(basename "$f").yml"
+                harden_md="/tmp/harden-$id-$(basename "$f").md"
+                injected="/tmp/injected-$id-$(basename "$f").json"
+
+                if (cd "$clone_dir" && docker compose -f "$f" config > "$resolved" 2>/tmp/cfgerr); then
+                  src="$resolved"
+                else
+                  echo "compose config falhou; injetando/validando sobre bruto:"
+                  cat /tmp/cfgerr
+                  src="$clone_dir/$f"
+                fi
+
+                if python3 "$GITHUB_WORKSPACE/base/scripts/harden_compose.py" \
+                     --in "$src" --out "$hardened" --md "$harden_md" \
+                     --injected-out "$injected"; then
+                  to_validate="$hardened"
+                else
+                  echo "harden_compose falhou; validando sem injeção"
+                  to_validate="$src"
+                  : > "$harden_md"
+                  : > "$injected"
+                fi
+
+                md="/tmp/md-$id-$(basename "$f").md"
+                validate_args=(--compose "$to_validate" --raw "$clone_dir/$f" --md "$md")
+                [ -s "$injected" ] && validate_args+=(--injected "$injected")
+                if python3 "$GITHUB_WORKSPACE/base/scripts/validate_compose.py" \
+                     "${validate_args[@]}"; then :
+                else sub_ok=0; fi
+
+                # Acumula a seção do compose com respiro entre fragmentos.
+                {
+                  echo "<!-- compose: $id/$f -->"
+                  cat "$md"
+                  if [ -s "$harden_md" ]; then
+                    echo
+                    cat "$harden_md"
+                  fi
+                } >> "$compose_md"
+                echo "::endgroup::"
+              done
+            fi
+
+            # 5f. resolve imagem do compose (sem campo top-level no JSON).
+            ref=""
+            if [ "$sub_ok" = "1" ]; then
+              ref=$(cd "$clone_dir" && grep -hoE 'image:[[:space:]]*[^[:space:]]+' docker-compose*.y*ml 2>/dev/null \
+                    | grep -viE 'nginx|redis|postgres|postgresql|mariadb|mysql|haproxy|caddy|traefik|envoy|placeholder' \
+                    | head -1 | awk '{print $2}' | sed 's/["'\'']//g' || true)
+              echo "Imagem: '${ref:-<nenhuma>}'"
+            fi
+
+            # 5g. auditoria da imagem (fragmento traz seu próprio cabeçalho).
+            if [ "$sub_ok" = "1" ] && [ -n "$ref" ]; then
+              chmod +x "$GITHUB_WORKSPACE/base/scripts/audit_image.sh"
+              if "$GITHUB_WORKSPACE/base/scripts/audit_image.sh" "$ref" "$img_md"; then :
+              else sub_ok=0; fi
+            fi
+
+            # 5h. Monta o relatório da submissão: lista de repositório
+            #     contígua logo abaixo do título, e cada seção seguinte
+            #     (me.json, compose, imagem) separada por UMA linha em branco.
+            {
+              echo "### Submission \`$id\`"
+              echo
+              echo "Repository: \`$url\`"
+              echo
+            } >> /tmp/report.md
+            cat "$repo_md" >> /tmp/report.md
+            [ -s "$me_md" ] && section "$me_md"
+            [ -s "$compose_md" ] && section "$compose_md"
+            [ -s "$img_md" ] && section "$img_md"
+            echo >> /tmp/report.md
+
+            if [ "$sub_ok" != "1" ]; then
+              overall=0
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "result=$overall" >> "$GITHUB_OUTPUT"
+
+      # 6. Step Summary (sempre visível na aba Actions).
+      - name: Step summary
+        if: always()
+        run: |
+          {
+            echo "# 🛡️ The 500MB Club — PR Security Gate"
+            echo
+            cat /tmp/report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 7. Empacota relatório + número do PR para o job de comentário.
+      - name: Package artifact
+        if: always()
+        run: |
+          mkdir -p /tmp/out
+          cp /tmp/report.md /tmp/out/report.md 2>/dev/null || \
+            echo "_empty report_" > /tmp/out/report.md
+          echo "${{ github.event.pull_request.number }}" > /tmp/out/pr_number
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-report
+          path: /tmp/out
+          retention-days: 5
+          if-no-files-found: ignore
+
+      # 8. Veredito: bloqueia o merge se a resolucao ou alguma submissao falhou.
+      - name: Verdict
+        if: always()
+        run: |
+          resolve="${{ steps.resolve.outputs.ok || '0' }}"
+          subs="${{ steps.subs.outputs.result || '0' }}"
+          echo "resolve=$resolve subs=$subs"
+          if [ "$resolve" != "1" ] || [ "$subs" != "1" ]; then
+            echo "::error::Submission rejected. See the checklist in the PR comment."
+            exit 1
+          fi
+          echo "Submissão dentro de todas as regras."

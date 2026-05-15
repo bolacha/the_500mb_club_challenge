@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+The 500MB Club - injeta hardening padrao no docker-compose do participante.
+
+Roda APOS `docker compose config` (que ja resolveu anchors, defaults, etc.)
+e ANTES de `validate_compose.py`. Para cada servico classificado, adiciona
+os flags de hardening *somente se ausentes*. Valores explicitos do
+participante sao preservados - se ele escreveu `read_only: false`, o
+validador (que roda em seguida) reprova.
+
+Politica de injecao:
+  - api:    read_only=true, cap_drop=[ALL], security_opt+= no-new-privileges,
+            tmpfs+= /tmp
+  - lb:     read_only=true, security_opt+= no-new-privileges,
+            tmpfs+= /var/cache/nginx,/var/run,/tmp
+  - redis:  read_only=true, security_opt+= no-new-privileges
+  - db:     security_opt+= no-new-privileges
+            (postgres/mariadb/mysql: NAO forcamos read_only porque o engine
+            precisa escrever em /var/lib/<engine>/data, /var/run/<engine> e
+            /tmp; participante e responsavel por configurar volume e tmpfs.)
+
+  Em lb/redis/db NAO injetamos cap_drop. As imagens oficiais desses servicos
+  iniciam como root e usam setpriv/su-exec/chown pra cair pra um usuario
+  dedicado no boot - dropar capabilities indiscriminadamente quebra esse
+  fluxo (`setresuid failed: Operation not permitted`). A defesa nesses
+  papeis fica em no-new-privileges + read_only + usuario non-root da
+  propria imagem. Se o participante quiser dropar caps manualmente
+  (declarando cap_drop/cap_add explicitamente), o validator respeita - so
+  nao injetamos nada por padrao.
+
+Storage suportado (allowlist): redis, postgres, mariadb, mysql. Qualquer
+outro banco (mongo, cassandra, elastic, etc.) nao cabe no orcamento de
+500 MiB nem foi modelado pelo desafio - cai no perfil `api`, com hardening
+estrito, e tende a falhar a validacao.
+
+Nao tocamos em: mem_limit, cpus, user, image, command, networks, volumes
+(decisoes do participante - validate_compose.py audita).
+
+Uso:
+  harden_compose.py --in resolved.yml --out expanded.yml
+                    [--md report.md] [--injected-out injected.json] [--quiet]
+
+Saida:
+  expanded.yml com o compose endurecido (pronto pra validar/rodar)
+  report.md (opcional) lista o que foi injetado por servico.
+  injected.json (opcional) lista os campos injetados em formato estavel;
+    o validate_compose.py consome esse JSON pra emitir WARNs nos checks
+    de hardening correspondentes, alertando o participante de que o
+    compose dele dependia da injecao do gate.
+  exit 0 sempre que o YAML foi parseavel; 2 erro de uso/parse.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("ERROR: PyYAML not installed (pip install pyyaml)", file=sys.stderr)
+    sys.exit(2)
+
+NNP = "no-new-privileges:true"
+
+# Bancos SQL aceitos como storage. Casamos pelo prefixo da tag da imagem
+# (ex.: `postgres:16-alpine`, `mariadb:11`, `mysql:8.4`) e tambem por
+# variantes oficiais comuns (`bitnami/postgresql`, `mysql/mysql-server`).
+DB_IMAGE_TOKENS = ("postgres", "postgresql", "mariadb", "mysql")
+
+
+def classify_role(svc: dict) -> str:
+    image = str(svc.get("image", "")).lower()
+    if "redis" in image:
+        return "redis"
+    if any(p in image for p in DB_IMAGE_TOKENS):
+        return "db"
+    if any(p in image for p in ("nginx", "haproxy", "caddy", "traefik", "envoy")):
+        return "lb"
+    if svc.get("build") or image:
+        return "api"
+    return "unknown"
+
+
+def ensure_list(svc: dict, key: str) -> list:
+    val = svc.get(key)
+    if val is None:
+        svc[key] = []
+    elif not isinstance(val, list):
+        svc[key] = [val]
+    return svc[key]
+
+
+def has_nnp(security_opt: list) -> bool:
+    return any("no-new-privileges" in str(x) and "true" in str(x).lower()
+               for x in security_opt)
+
+
+def inject(svc: dict, role: str) -> list[tuple[str, str]]:
+    """Injeta hardening adequado ao papel; retorna [(field_id, display)].
+
+    `field_id` e estavel e serve para o validate_compose.py emitir WARNs
+    sob os checks de hardening correspondentes. `display` e o texto
+    legivel usado no relatorio Markdown e no log.
+    """
+    touched: list[tuple[str, str]] = []
+
+    if role not in ("api", "lb", "redis", "db"):
+        return touched
+
+    # read_only: SQL DBs precisam escrever em /var/lib/<engine>/data, runtime
+    # sockets em /var/run/<engine> e /tmp; nao injetamos read_only=true pra
+    # eles. Para api/lb/redis injetamos quando ausente (se vier explicitamente
+    # false, mantemos e o validate_compose.py reprova).
+    if role != "db" and "read_only" not in svc:
+        svc["read_only"] = True
+        touched.append(("read_only", "read_only=true"))
+
+    # cap_drop: so injetamos no perfil `api` (codigo nao-confiavel, sem
+    # entrypoint que exige caps). Em lb/redis/db as imagens oficiais
+    # iniciam como root e usam setpriv/su-exec/chown para baixar pra um
+    # usuario dedicado - cap_drop=[ALL] quebra esse boot. Defesa nesses
+    # papeis = no-new-privileges + read_only (quando aplicavel) + USER
+    # non-root da propria imagem. cap_drop declarado pelo participante
+    # e respeitado; o validator continua reprovando cap_add em API.
+    if role == "api" and "cap_drop" not in svc:
+        svc["cap_drop"] = ["ALL"]
+        touched.append(("cap_drop", "cap_drop=[ALL]"))
+
+    # security_opt: garante no-new-privileges. Lista e aditiva.
+    sec = ensure_list(svc, "security_opt")
+    if not has_nnp(sec):
+        sec.append(NNP)
+        touched.append(("no-new-privileges", f"security_opt+={NNP}"))
+
+    if role == "api":
+        tmpfs = ensure_list(svc, "tmpfs")
+        if "/tmp" not in tmpfs:
+            tmpfs.append("/tmp")
+            touched.append(("tmpfs", "tmpfs+=/tmp"))
+
+    elif role == "lb":
+        tmpfs = ensure_list(svc, "tmpfs")
+        for path in ("/var/cache/nginx", "/var/run", "/tmp"):
+            if path not in tmpfs:
+                tmpfs.append(path)
+                touched.append(("tmpfs", f"tmpfs+={path}"))
+
+    return touched
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="src", required=True,
+                    help="compose ja resolvido (saida de `docker compose config`)")
+    ap.add_argument("--out", dest="dst", required=True,
+                    help="compose endurecido a escrever")
+    ap.add_argument("--md", help="caminho opcional para relatorio Markdown")
+    ap.add_argument("--injected-out", dest="injected_out",
+                    help="caminho opcional para JSON com campos injetados "
+                         "por servico (consumido pelo validate_compose.py)")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        data = yaml.safe_load(Path(args.src).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as e:
+        print(f"ERROR: parsing {args.src}: {e}", file=sys.stderr)
+        return 2
+
+    if not isinstance(data, dict) or "services" not in data:
+        print(f"ERROR: {args.src} does not look like a valid docker-compose",
+              file=sys.stderr)
+        return 2
+
+    services = data.get("services") or {}
+    report: dict[str, tuple[str, list[tuple[str, str]]]] = {}
+
+    for name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        role = classify_role(svc)
+        touched = inject(svc, role)
+        report[name] = (role, touched)
+
+    Path(args.dst).write_text(
+        yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    if not args.quiet:
+        for name, (role, touched) in report.items():
+            tag = ", ".join(d for _, d in touched) if touched else "nada a injetar"
+            print(f"[{role:>7}] {name}: {tag}")
+
+    if args.md:
+        lines = [
+            "### Hardening injected automatically",
+            "",
+            "These flags were added by the gate when missing from the compose. "
+            "Your explicit values were preserved (and validated afterwards).",
+            "",
+        ]
+        any_touched = False
+        for name, (role, touched) in report.items():
+            if not touched:
+                continue
+            any_touched = True
+            display = ", ".join(d for _, d in touched)
+            lines.append(f"- `{name}` ({role}): {display}")
+        if not any_touched:
+            lines.append("- Nothing injected (compose already had everything).")
+        lines.append("")
+        Path(args.md).write_text("\n".join(lines), encoding="utf-8")
+
+    if args.injected_out:
+        payload = {
+            name: {"role": role, "fields": [fid for fid, _ in touched]}
+            for name, (role, touched) in report.items()
+            if touched
+        }
+        Path(args.injected_out).write_text(
+            json.dumps(payload, indent=2), encoding="utf-8")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

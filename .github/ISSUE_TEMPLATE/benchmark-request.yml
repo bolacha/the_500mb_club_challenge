@@ -1,0 +1,44 @@
+name: Benchmark request
+description: Request a re-run of the benchmark on the Pi-Bench daemon for an already-merged submission.
+title: "test/<id>"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to ask the Pi-Bench daemon to re-run a benchmark on the Raspberry Pi
+        for a submission you already merged. This does **not** accept new code — code changes
+        always go through a PR (see [submitting.md](../blob/master/docs/en/submitting.md)).
+
+        The full flow, label lifecycle and rejection reasons are documented in
+        [testing.md](../blob/master/docs/en/testing.md).
+  - type: input
+    id: submission_id
+    attributes:
+      label: Submission id
+      description: |
+        The `<id>` to re-benchmark — must match one of the `submissions[].id` entries in
+        `submissions/<your-login>.json` on the default branch. Replace `<id>` in the issue
+        title with this value (for example, `test/go`).
+      placeholder: "go"
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Why do you want a re-run?
+      description: Optional. A short note helps maintainers triage if anything goes wrong.
+      placeholder: |
+        Published a new image tag with a smaller binary; want to confirm the new
+        efficiency score on the Pi.
+    validations:
+      required: false
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: My submission is already merged on the default branch (`submissions/<my-login>.json` exists).
+          required: true
+        - label: The issue title above is `test/<id>` with my real id substituted in (not the literal `<id>` placeholder).
+          required: true
